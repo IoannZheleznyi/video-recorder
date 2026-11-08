@@ -1,0 +1,16 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated videos and debug screenshots
+# (the sample recording lives in demo/ and is committed)
+video/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/

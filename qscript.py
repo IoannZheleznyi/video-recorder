@@ -22,30 +22,18 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
-# --------------------------------------------------------------------------
-# Global variable (the main script may override it at startup)
-# --------------------------------------------------------------------------
 PATH_TO_VIDEO_FOLDER = "./video"
 
-# --------------------------------------------------------------------------
-# Settings
-# --------------------------------------------------------------------------
 VIEWPORT = {"width": 1280, "height": 720}
-HEADLESS = os.environ.get("HEADLESS", "1") != "0"  # HEADLESS=0 shows the browser
-RESULTS_TIMEOUT_S = 60  # results are rendered client-side and can be slow
+HEADLESS = os.environ.get("HEADLESS", "1") != "0"
+RESULTS_TIMEOUT_S = 60
 
 SEL_SEARCH_BOX = 'textarea[name="q"]'
 SEL_SEARCH_BUTTON = 'form button[type="submit"]'
 SEL_FIRST_RESULT = 'a[data-testid="result-title-a"]'
 
-# Current pointer position and current page (needed so that ShowCallout can
-# keep the simple signature ShowCallout(text, bgColor, textColor, fade)).
 _state = {"page": None, "x": 0.0, "y": 0.0}
 
-# --------------------------------------------------------------------------
-# JavaScript injected into every page (IIFE: add_init_script evaluates the
-# string as-is and does not call functions automatically)
-# --------------------------------------------------------------------------
 INIT_SCRIPT = r"""
 (() => {
   if (window.__qcInstalled) return;
@@ -166,9 +154,6 @@ INIT_SCRIPT = r"""
 """
 
 
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
 def ShowCallout(text, bgColor="#FFE600", textColor="#000000", fade=True,
                 hold=1.5, page=None):
     """Show a callout (yellow rectangle, black 16pt text) over the page.
@@ -193,7 +178,7 @@ def ShowCallout(text, bgColor="#FFE600", textColor="#000000", fade=True,
             [str(text), bgColor, textColor, fade_ms, int(hold * 1000)],
         )
     except PlaywrightError:
-        pass  # a navigation may be in progress; the callout is only decoration
+        pass
 
 
 def _ease(t):
@@ -209,7 +194,6 @@ def _glide(page, tx, ty):
         return
     duration = min(1.5, max(0.6, dist / 700.0))
 
-    # quadratic Bezier: the control point is shifted sideways from the midpoint
     nx, ny = -(ty - sy) / dist, (tx - sx) / dist
     offset = dist * random.uniform(-0.15, 0.15)
     cx = (sx + tx) / 2 + nx * offset
@@ -244,7 +228,6 @@ def _move_and_click(page, locator):
     tx, ty = _target_point(locator)
     _glide(page, tx, ty)
     time.sleep(0.3)
-    # real mouse down/up: triggers default actions (focus, submit, navigation)
     page.mouse.down()
     time.sleep(0.09)
     page.mouse.up()
@@ -290,15 +273,10 @@ def _locale(language, country):
     return "en-US"
 
 
-# --------------------------------------------------------------------------
-# Scenario
-# --------------------------------------------------------------------------
 def _scenario(page, url, company_name, postcode, city, street, house_no):
-    # 1. open the page
     page.goto(url, wait_until="domcontentloaded")
     page.locator(SEL_SEARCH_BOX).first.wait_for(state="visible", timeout=30000)
 
-    # 2. show the custom cursor (the injected script draws it on first mouse event)
     _state["x"], _state["y"] = 120.0, 120.0
     page.mouse.move(120, 120)
     time.sleep(0.8)
@@ -309,25 +287,20 @@ def _scenario(page, url, company_name, postcode, city, street, house_no):
     ) if p)
     ShowCallout("%s: %s" % (company_name, address) if address else company_name)
 
-    # 3. move smoothly to the search box and click it
     _move_and_click(page, page.locator(SEL_SEARCH_BOX).first)
     time.sleep(0.5)
 
-    # 4. type the query character by character
     query = "Magento developer in %s" % city if city else "Magento developer"
     _type_like_human(page, query)
     time.sleep(0.6)
 
-    # 5. click the search button (full page navigation follows)
     _move_and_click(page, page.locator(SEL_SEARCH_BUTTON).first)
 
-    # 6. wait for the results
     _wait_for_results(page)
-    page.mouse.move(_state["x"], _state["y"])  # re-sync the cursor on the new page
+    page.mouse.move(_state["x"], _state["y"])
     time.sleep(1.0)
     ShowCallout("Opening the first result", hold=1.0)
 
-    # 7. move to the first result and click it
     _move_and_click(page, page.locator(SEL_FIRST_RESULT).first)
     try:
         page.wait_for_load_state("load", timeout=20000)
@@ -339,9 +312,6 @@ def _scenario(page, url, company_name, postcode, city, street, house_no):
     time.sleep(4.5)
 
 
-# --------------------------------------------------------------------------
-# Main function
-# --------------------------------------------------------------------------
 def CaptureVideo_Magento(
     url,
     company_name,
@@ -361,7 +331,7 @@ def CaptureVideo_Magento(
     ok = False
     video_src = None
     try:
-        folder = os.path.abspath(PATH_TO_VIDEO_FOLDER)  # read at call time
+        folder = os.path.abspath(PATH_TO_VIDEO_FOLDER)
         os.makedirs(folder, exist_ok=True)
         _state.update(page=None, x=0.0, y=0.0)
 
@@ -370,8 +340,6 @@ def CaptureVideo_Magento(
                 headless=HEADLESS,
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            # the default headless user agent contains "HeadlessChrome",
-            # which search engines treat as a bot
             user_agent = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/%s Safari/537.36" % browser.version
@@ -390,7 +358,7 @@ def CaptureVideo_Magento(
                 _state["page"] = page
                 _scenario(page, url, company_name, postcode, city, street, house_no)
                 ok = True
-            except Exception as exc:  # noqa: BLE001 - report and return None
+            except Exception as exc:
                 print("[qscript] scenario failed for %r: %s" % (company_name, exc))
                 if page is not None:
                     try:
@@ -399,11 +367,11 @@ def CaptureVideo_Magento(
                         page.screenshot(path=shot)
                         print("[qscript] page: %s | %s" % (page.url, page.title()))
                         print("[qscript] debug screenshot: %s" % shot)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         pass
             finally:
                 video = page.video if page is not None else None
-                context.close()  # finalizes the video file
+                context.close()
                 browser.close()
                 if video is not None:
                     video_src = video.path()
@@ -413,7 +381,7 @@ def CaptureVideo_Magento(
             return None
         if not ok:
             try:
-                os.remove(str(video_src))  # do not leave broken recordings behind
+                os.remove(str(video_src))
             except OSError:
                 pass
             return None
@@ -421,6 +389,6 @@ def CaptureVideo_Magento(
         dest = os.path.join(folder, _safe_filename(company_name) + ".webm")
         os.replace(str(video_src), dest)
         return os.path.abspath(dest)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print("[qscript] error: %s" % exc)
         return None
