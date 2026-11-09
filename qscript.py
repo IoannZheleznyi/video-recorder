@@ -25,14 +25,18 @@ from playwright.sync_api import sync_playwright
 PATH_TO_VIDEO_FOLDER = "./video"
 
 VIEWPORT = {"width": 1280, "height": 720}
-HEADLESS = os.environ.get("HEADLESS", "1") != "0"
+HEADLESS = os.environ.get("HEADLESS", "0").strip().lower() in ("1", "true", "yes")
 RESULTS_TIMEOUT_S = 60
+CHALLENGE_TIMEOUT_S = 180
 
 SEL_SEARCH_BOX = 'textarea[name="q"]'
 SEL_SEARCH_BUTTON = 'form button[type="submit"]'
-SEL_FIRST_RESULT = 'a[data-testid="result-title-a"]'
+SEL_SEARCH_BUTTON_SCOPED = 'form:has(textarea[name="q"]) button[type="submit"]'
+SEL_FIRST_RESULT = (
+    'a[data-testid="result-title-a"], article[data-testid="result"] h2 a'
+)
 
-_state = {"page": None, "x": 0.0, "y": 0.0}
+_state = {"page": None, "x": 0.0, "y": 0.0, "headless": False}
 
 INIT_SCRIPT = r"""
 (() => {
@@ -214,23 +218,121 @@ def _glide(page, tx, ty):
     _state["x"], _state["y"] = tx, ty
 
 
+def _stable_box(locator, tries=20):
+    """Bounding box of the element once it stops moving (animations, layout shifts)."""
+    previous = None
+    box = None
+    for _ in range(tries):
+        box = locator.bounding_box()
+        if box and previous and all(
+            abs(box[k] - previous[k]) < 1 for k in ("x", "y", "width", "height")
+        ):
+            return box
+        previous = box
+        time.sleep(0.1)
+    if not box:
+        raise RuntimeError("element has no bounding box")
+    return box
+
+
 def _target_point(locator):
     """A random point inside the element (kept near its left part for wide ones)."""
     locator.scroll_into_view_if_needed(timeout=5000)
-    box = locator.bounding_box()
-    if not box:
-        raise RuntimeError("element has no bounding box")
+    box = _stable_box(locator)
     dx = min(box["width"] * 0.5, random.uniform(30, 120))
     return box["x"] + dx, box["y"] + box["height"] / 2
 
 
+def _point_hits(locator, x, y):
+    """True if the element (or one of its children) is under the point (x, y)."""
+    try:
+        return bool(locator.evaluate(
+            "(el, p) => { const t = document.elementFromPoint(p[0], p[1]);"
+            " return !!t && (t === el || el.contains(t)); }",
+            [x, y],
+        ))
+    except PlaywrightError:
+        return False
+
+
 def _move_and_click(page, locator):
-    tx, ty = _target_point(locator)
-    _glide(page, tx, ty)
-    time.sleep(0.3)
+    """Glide to the element and click it with the real mouse.
+
+    The layout can shift while the cursor is moving (suggestions, banners,
+    fonts loading), so the position is checked with elementFromPoint and the
+    cursor is re-aimed until it really is over the element.
+    """
+    for _ in range(4):
+        tx, ty = _target_point(locator)
+        _glide(page, tx, ty)
+        time.sleep(0.25)
+        if _point_hits(locator, _state["x"], _state["y"]):
+            break
     page.mouse.down()
     time.sleep(0.09)
     page.mouse.up()
+
+
+def _search_button(page, timeout_s=10):
+    """The visible submit button of the form that contains the search box."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        for selector in (SEL_SEARCH_BUTTON_SCOPED, SEL_SEARCH_BUTTON):
+            items = page.locator(selector)
+            for i in range(items.count()):
+                item = items.nth(i)
+                if item.is_visible():
+                    return item
+        if time.monotonic() >= deadline:
+            return page.locator(SEL_SEARCH_BUTTON).first
+        time.sleep(0.3)
+
+
+def _raise_if_blocked(page):
+    """Fail fast when DuckDuckGo answers with its bot-protection error page."""
+    try:
+        url = page.url
+    except PlaywrightError:
+        return
+    if "static-pages" in url and "error" in url:
+        raise RuntimeError(
+            "DuckDuckGo blocked the request as automated traffic (%s). "
+            "Try again later or from another network." % url
+        )
+
+
+def _search_submitted(page, wait_s):
+    """True once the search was submitted (URL has a query or results are shown)."""
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        _raise_if_blocked(page)
+        try:
+            if "q=" in page.url or page.locator(SEL_FIRST_RESULT).count() > 0:
+                return True
+        except PlaywrightError:
+            pass
+        page.wait_for_timeout(300)
+    return False
+
+
+def _submit_search(page):
+    """Click the search button; fall back to other ways if the click missed."""
+    button = _search_button(page)
+    _move_and_click(page, button)
+    if _search_submitted(page, 6):
+        return
+
+    print("[qscript] the click did not submit the search, retrying")
+    try:
+        button.click(timeout=5000)
+    except (PlaywrightTimeout, PlaywrightError):
+        pass
+    if _search_submitted(page, 6):
+        return
+
+    print("[qscript] still not submitted, pressing Enter")
+    page.locator(SEL_SEARCH_BOX).first.focus()
+    page.keyboard.press("Enter")
 
 
 def _type_like_human(page, text):
@@ -243,25 +345,82 @@ def _type_like_human(page, text):
         time.sleep(delay)
 
 
+def _challenge_visible(page):
+    """True if DuckDuckGo shows its bot check (CAPTCHA) instead of results."""
+    try:
+        return bool(page.evaluate(
+            "() => !!document.querySelector('.anomaly-modal__modal, form[action*=\"anomaly\"]')"
+            " || /bots use DuckDuckGo too|select all squares/i.test("
+            "document.body ? document.body.innerText : '')"
+        ))
+    except PlaywrightError:
+        return False
+
+
 def _wait_for_results(page, timeout_s=RESULTS_TIMEOUT_S):
     """Poll until the first result is visible.
 
     The search causes a full page navigation, so the JS context of the old page
     is destroyed; errors raised during that moment are swallowed and we retry.
+    If DuckDuckGo shows a bot check, a visible browser window waits for the
+    person to solve it; headless mode fails with a clear message.
     """
     deadline = time.monotonic() + timeout_s
+    warned = False
     while time.monotonic() < deadline:
+        _raise_if_blocked(page)
         try:
             page.locator(SEL_FIRST_RESULT).first.wait_for(state="visible", timeout=2000)
             return
         except (PlaywrightTimeout, PlaywrightError):
-            time.sleep(0.3)
+            pass
+        if _challenge_visible(page):
+            if _state["headless"]:
+                raise RuntimeError(
+                    "DuckDuckGo shows a bot check (CAPTCHA) instead of results. "
+                    "Run without HEADLESS=1 and solve it in the window, or try later / "
+                    "from another network."
+                )
+            if not warned:
+                print("[qscript] DuckDuckGo shows a bot check - solve it in the browser "
+                      "window, waiting up to %d s" % CHALLENGE_TIMEOUT_S)
+                deadline = max(deadline, time.monotonic() + CHALLENGE_TIMEOUT_S)
+                warned = True
+        page.wait_for_timeout(300)
     raise RuntimeError("search results did not appear within %d s" % timeout_s)
 
 
 def _safe_filename(name):
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name or "").strip(" .")
     return name or "video"
+
+
+def _launch_browser(p):
+    """Start Chromium: with a window by default, headless if HEADLESS=1 or no display."""
+    channel = os.environ.get("BROWSER_CHANNEL") or None
+    attempts = []
+    if not HEADLESS:
+        attempts.append((False, channel))
+    attempts.append((True, channel or "chromium"))
+    attempts.append((True, None))
+    last_error = None
+    for headless, ch in attempts:
+        kwargs = {
+            "headless": headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if ch:
+            kwargs["channel"] = ch
+        try:
+            browser = p.chromium.launch(**kwargs)
+        except PlaywrightError as exc:
+            last_error = exc
+            print("[qscript] cannot start the browser (headless=%s, channel=%s): %s"
+                  % (headless, ch, str(exc).splitlines()[0]))
+            continue
+        _state["headless"] = headless
+        return browser
+    raise last_error
 
 
 def _locale(language, country):
@@ -294,7 +453,7 @@ def _scenario(page, url, company_name, postcode, city, street, house_no):
     _type_like_human(page, query)
     time.sleep(0.6)
 
-    _move_and_click(page, page.locator(SEL_SEARCH_BUTTON).first)
+    _submit_search(page)
 
     _wait_for_results(page)
     page.mouse.move(_state["x"], _state["y"])
@@ -336,20 +495,12 @@ def CaptureVideo_Magento(
         _state.update(page=None, x=0.0, y=0.0)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=HEADLESS,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            user_agent = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/%s Safari/537.36" % browser.version
-            )
+            browser = _launch_browser(p)
             context = browser.new_context(
                 viewport=VIEWPORT,
                 record_video_dir=folder,
                 record_video_size=VIEWPORT,
                 locale=_locale(language, country),
-                user_agent=user_agent,
             )
             try:
                 context.add_init_script(INIT_SCRIPT)
@@ -366,6 +517,8 @@ def CaptureVideo_Magento(
                             folder, "debug_%s.png" % _safe_filename(company_name))
                         page.screenshot(path=shot)
                         print("[qscript] page: %s | %s" % (page.url, page.title()))
+                        print("[qscript] page text: %s"
+                              % " ".join(page.inner_text("body").split())[:300])
                         print("[qscript] debug screenshot: %s" % shot)
                     except Exception:
                         pass

@@ -32,7 +32,7 @@ A sample recording is available in [`demo/`](demo/).
 ## Requirements
 
 - Python 3.9+
-- Playwright for Python (installed from `requirements.txt`)
+- Playwright for Python 1.49+ (installed from `requirements.txt`)
 - No other third-party libraries (the stdlib `csv` module is used for reading the input)
 
 ## Installation
@@ -66,10 +66,12 @@ Optional arguments:
 ```bash
 python capture_video.py data.csv              # another CSV file
 python capture_video.py --video-dir out       # another output folder
-HEADLESS=0 python capture_video.py            # show the browser window (macOS / Linux)
+HEADLESS=1 python capture_video.py            # run without a browser window (macOS / Linux)
 ```
 
-On Windows PowerShell use `$env:HEADLESS="0"; python capture_video.py`.
+On Windows PowerShell use `$env:HEADLESS="1"; python capture_video.py`.
+
+By default the browser window is shown: it is more reliable against bot detection. If no display is available, the script falls back to headless mode automatically.
 
 For every row the script prints the path of the saved video:
 
@@ -132,7 +134,7 @@ Constants at the top of `qscript.py`:
 | --- | --- |
 | `PATH_TO_VIDEO_FOLDER` | Output folder (default `./video`) |
 | `VIEWPORT` | Viewport and video size (default 1280x720) |
-| `HEADLESS` | Controlled by the `HEADLESS` environment variable (`0` shows the browser) |
+| `HEADLESS` | Environment variable: `1` runs without a window (default: window is shown) |
 | `RESULTS_TIMEOUT_S` | How long to wait for search results (default 60 s) |
 | `SEL_SEARCH_BOX`, `SEL_SEARCH_BUTTON`, `SEL_FIRST_RESULT` | DuckDuckGo selectors |
 
@@ -142,8 +144,15 @@ Constants at the top of `qscript.py`:
   (`source .venv/bin/activate`) or use `python3` / `pip3`.
 - **`search results did not appear within 60 s`** - DuckDuckGo may show a bot check or the
   markup may have changed. A screenshot `debug_<company>.png` is saved to the video folder
-  together with the page URL and title. Run with `HEADLESS=0` to see what happens, or try
+  together with the page URL and title. Watch the browser window to see what happens, or try
   again later / from another network.
+- **DuckDuckGo error page `418` / "blocked the request as automated traffic"** - the site
+  detected automation. The script already runs headless mode as full Chromium
+  (`channel="chromium"`, needs Playwright 1.49+). If it still happens, wait a few minutes,
+  switch network, or set `BROWSER_CHANNEL=chrome` to use an installed Google Chrome.
+- **Bot check (CAPTCHA) on the results page** - DuckDuckGo may show a challenge instead of results.
+  In the default (window) mode the script waits up to 3 minutes while you solve it in the browser window,
+  then continues. With `HEADLESS=1` it fails with a clear message.
 - **Selectors stopped working** - update the `SEL_*` constants in `qscript.py`.
 
 ## Known limitations
