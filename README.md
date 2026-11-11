@@ -27,13 +27,16 @@ A sample recording is available in [`demo/`](demo/).
 | `capture_video.py` | Main script: reads the CSV and calls `qscript.CaptureVideo_Magento(...)` for every row |
 | `qscript.py` | Automation module: `CaptureVideo_Magento(...)`, `ShowCallout(...)`, global `PATH_TO_VIDEO_FOLDER` |
 | `input.csv` | Sample input (3 rows) |
-| `requirements.txt` | Python dependencies (`playwright` only) |
+| `web_service.py` | Flask web service with a SQLite database: upload, lookup by company name, serving of videos |
+| `video_client.py` | Client functions `UploadVideo(...)` and `GetVideoURL(...)` used by the recorder |
+| `requirements.txt` | Python dependencies (`playwright`, `flask`, `requests`) |
 
 ## Requirements
 
 - Python 3.9+
 - Playwright for Python 1.49+ (installed from `requirements.txt`)
-- No other third-party libraries (the stdlib `csv` module is used for reading the input)
+- Flask and requests (installed from `requirements.txt`)
+- No other third-party libraries: the stdlib is used for everything else (`csv`, `sqlite3`, ...)
 
 ## Installation
 
@@ -82,6 +85,78 @@ For every row the script prints the path of the saved video:
 
 Videos are saved to `./video/<company_name>.webm` (the folder is created if missing).
 Open them in a browser or VLC (QuickTime does not play `.webm`).
+
+## Web service and video preview
+
+The recorder can upload every recorded video to a small web service and open the
+uploaded video in a browser.
+
+Start the service in one terminal (it creates `videos.db` and `uploads/` next to `web_service.py`):
+
+```bash
+python web_service.py
+```
+
+It listens on `0.0.0.0:8000` by default. Change it with `FLASK_HOST` / `FLASK_PORT`
+(on Windows PowerShell: `$env:FLASK_PORT="9000"; python web_service.py`).
+
+Run the recorder in another terminal with `--server`:
+
+```bash
+python capture_video.py --server http://127.0.0.1:8000
+python capture_video.py --server http://127.0.0.1:8000 --view-seconds 20
+python capture_video.py --server http://127.0.0.1:8000 --view-seconds 0
+```
+
+After each recorded video the recorder uploads it, prints the returned URL and opens it in
+a visible Chromium window. `--view-seconds N` keeps the window open for N seconds
+(default 10); `0` keeps it open until you press Enter. A failed upload or preview is logged
+and the loop continues with the next row.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/upload` | `UploadVideo`: multipart form with `file` and `company_name`, returns `{"company_name", "video_url"}` |
+| `GET` | `/get_video_url?company_name=<name>` | `GetVideoURL`: returns `{"company_name", "video_url"}`, `404` for an unknown name |
+| `GET` | `/media/<filename>` | Serves an uploaded video file (supports range requests, so seeking works) |
+| `GET` | `/videos` | Lists all records |
+
+Uploading the same `company_name` again updates the existing record (upsert, no duplicates).
+Errors are returned as JSON: `{"error": "..."}`.
+
+```bash
+curl -F "file=@video/Acme GmbH.webm" -F "company_name=Acme GmbH" http://127.0.0.1:8000/upload
+curl "http://127.0.0.1:8000/get_video_url?company_name=Acme%20GmbH"
+```
+
+### Database
+
+SQLite (`videos.db`), table `videos`: `id`, `company_name` (unique), `file_path` (absolute path
+on disk), `video_url`, `created_at`, `updated_at`. Only the path and the URL are stored, never
+the video bytes; the files live in `uploads/`.
+
+### Client functions
+
+```python
+from video_client import UploadVideo, GetVideoURL
+
+url = UploadVideo("http://127.0.0.1:8000", "video/Acme GmbH.webm", "Acme GmbH")
+url = GetVideoURL("http://127.0.0.1:8000", "Acme GmbH")
+```
+
+Both return the URL as a string and raise `VideoClientError` on failure
+(`VideoNotFoundError` when the company is unknown). `requests` is imported lazily, so the
+recorder runs without it when `--server` is not used.
+
+### Design notes
+
+- A new SQLite connection is opened per request (`flask.g`); WAL mode and a busy timeout
+  prevent "database is locked" errors during concurrent uploads.
+- Video URLs are built from `request.host_url`, not from a hard-coded host.
+- File names are derived from the company name and sanitized; different company names that
+  would map to the same file name get a short hash suffix so they never overwrite each other.
+- Files are written to a temporary name and renamed, so a half-uploaded file is never served.
 
 ## Input format
 
@@ -154,6 +229,10 @@ Constants at the top of `qscript.py`:
   In the default (window) mode the script waits up to 3 minutes while you solve it in the browser window,
   then continues. With `HEADLESS=1` it fails with a clear message.
 - **Selectors stopped working** - update the `SEL_*` constants in `qscript.py`.
+- **`UPLOAD FAILED: ... Connection refused`** - the web service is not running or the `--server`
+  address is wrong. Start `python web_service.py` and use the same host and port.
+- **`PREVIEW FAILED`** - the preview needs a visible browser window (`headless=False`), so it
+  cannot run on a machine without a display.
 
 ## Known limitations
 
