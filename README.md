@@ -27,16 +27,18 @@ A sample recording is available in [`demo/`](demo/).
 | `capture_video.py` | Main script: reads the CSV and calls `qscript.CaptureVideo_Magento(...)` for every row |
 | `qscript.py` | Automation module: `CaptureVideo_Magento(...)`, `ShowCallout(...)`, global `PATH_TO_VIDEO_FOLDER` |
 | `input.csv` | Sample input (3 rows) |
-| `web_service.py` | Flask web service with a SQLite database: upload, lookup by company name, serving of videos |
+| `web_service.py` | Flask web service with a PostgreSQL database: upload, lookup by company name, serving of videos |
 | `video_client.py` | Client functions `UploadVideo(...)` and `GetVideoURL(...)` used by the recorder |
-| `requirements.txt` | Python dependencies (`playwright`, `flask`, `requests`) |
+| `requirements.txt` | Python dependencies (`playwright`, `flask`, `requests`, `psycopg2-binary`) |
+| `Dockerfile`, `docker-compose.yml`, `docker/`, `video_service.wsgi` | Docker setup: Apache + mod_wsgi + Flask and PostgreSQL (see below) |
 
 ## Requirements
 
 - Python 3.9+
 - Playwright for Python 1.49+ (installed from `requirements.txt`)
-- Flask and requests (installed from `requirements.txt`)
-- No other third-party libraries: the stdlib is used for everything else (`csv`, `sqlite3`, ...)
+- Flask, requests and psycopg2 (installed from `requirements.txt`)
+- Docker with Docker Compose for the web service and the database
+- No other third-party libraries: the stdlib is used for everything else (`csv`, ...)
 
 ## Installation
 
@@ -86,21 +88,48 @@ For every row the script prints the path of the saved video:
 Videos are saved to `./video/<company_name>.webm` (the folder is created if missing).
 Open them in a browser or VLC (QuickTime does not play `.webm`).
 
-## Web service and video preview
+## Web service, database and Docker
 
-The recorder can upload every recorded video to a small web service and open the
-uploaded video in a browser.
+The recorder can upload every recorded video to a web service and open the uploaded video
+in a browser. The service runs in Docker: Apache + mod_wsgi serves the Flask application in
+the `web` container, PostgreSQL runs in a separate `db` container.
 
-Start the service in one terminal (it creates `videos.db` and `uploads/` next to `web_service.py`):
-
-```bash
-python web_service.py
+```
+recorder (host) --HTTP :8000--> web: Apache + mod_wsgi + Flask --psycopg2--> db: PostgreSQL 16
+                                      |                                          |
+                                volume "uploads"                           volume "db_data"
 ```
 
-It listens on `0.0.0.0:8000` by default. Change it with `FLASK_HOST` / `FLASK_PORT`
-(on Windows PowerShell: `$env:FLASK_PORT="9000"; python web_service.py`).
+### Run
 
-Run the recorder in another terminal with `--server`:
+Docker with Docker Compose is required.
+
+```bash
+docker compose up --build
+```
+
+The `db` container starts first; `web` starts only after the database healthcheck passes
+(`depends_on: condition: service_healthy`) and also retries the connection on its own.
+When `docker compose ps` shows both services as healthy, open
+[http://localhost:8000/videos](http://localhost:8000/videos): an empty list `[]` means the
+service works and the database is connected.
+
+Settings can be changed with a `.env` file next to `docker-compose.yml`
+(copy `.env.example`, do not commit `.env`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DB_NAME` | `videos` | Database name |
+| `DB_USER` | `video_user` | Database user |
+| `DB_PASSWORD` | `video_pass` | Database password (change it outside of local development) |
+| `WEB_PORT` | `8000` | Host port mapped to Apache's port 80 |
+
+The database settings reach the application only as environment variables
+(`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`); nothing is hard-coded.
+PostgreSQL applies `DB_USER` / `DB_PASSWORD` only when the `db_data` volume is created, so after
+changing them run `docker compose down -v` once to recreate the data.
+
+### Use it with the recorder
 
 ```bash
 python capture_video.py --server http://127.0.0.1:8000
@@ -113,6 +142,32 @@ a visible Chromium window. `--view-seconds N` keeps the window open for N second
 (default 10); `0` keeps it open until you press Enter. A failed upload or preview is logged
 and the loop continues with the next row.
 
+Without the recorder:
+
+```bash
+curl -F "file=@video/Acme GmbH.webm" -F "company_name=Acme GmbH" http://localhost:8000/upload
+curl "http://localhost:8000/get_video_url?company_name=Acme%20GmbH"
+```
+
+### Data survives restarts
+
+Videos live in the named volume `uploads` (`/app/uploads`), database files in `db_data`.
+
+```bash
+docker compose down      # removes the containers, keeps the volumes
+docker compose up        # the data and videos are still there
+docker compose down -v   # also deletes the volumes (all data is lost)
+```
+
+### Inspect
+
+```bash
+docker compose ps
+docker compose logs -f web
+docker compose exec web curl http://localhost/videos
+docker compose exec db psql -U video_user -d videos -c "SELECT * FROM videos;"
+```
+
 ### Endpoints
 
 | Method | Path | Purpose |
@@ -123,18 +178,35 @@ and the loop continues with the next row.
 | `GET` | `/videos` | Lists all records |
 
 Uploading the same `company_name` again updates the existing record (upsert, no duplicates).
-Errors are returned as JSON: `{"error": "..."}`.
-
-```bash
-curl -F "file=@video/Acme GmbH.webm" -F "company_name=Acme GmbH" http://127.0.0.1:8000/upload
-curl "http://127.0.0.1:8000/get_video_url?company_name=Acme%20GmbH"
-```
+Errors are returned as JSON: `{"error": "..."}`; `503` means the database is unavailable.
 
 ### Database
 
-SQLite (`videos.db`), table `videos`: `id`, `company_name` (unique), `file_path` (absolute path
-on disk), `video_url`, `created_at`, `updated_at`. Only the path and the URL are stored, never
-the video bytes; the files live in `uploads/`.
+PostgreSQL 16, table `videos` (created automatically on startup):
+
+```sql
+CREATE TABLE IF NOT EXISTS videos (
+    id SERIAL PRIMARY KEY,
+    company_name TEXT NOT NULL UNIQUE,
+    file_path TEXT NOT NULL,
+    video_url TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Only the path and the URL are stored, never the video bytes; the files live in `uploads/`.
+
+### Files
+
+| File | Purpose |
+| --- | --- |
+| `Dockerfile` | Debian + Apache + `libapache2-mod-wsgi-py3`; the Python packages are installed into a virtualenv that mod_wsgi uses |
+| `docker-compose.yml` | Services `web` and `db`, volumes `db_data` and `uploads`, healthchecks |
+| `docker/apache/video-service.conf` | Apache VirtualHost with the mod_wsgi daemon process |
+| `docker/entrypoint.sh` | Starts Apache in the foreground with the container's environment variables |
+| `video_service.wsgi` | WSGI entry point: `from web_service import app as application` |
+| `web_service.py` | Flask application (PostgreSQL via psycopg2) |
 
 ### Client functions
 
@@ -151,9 +223,16 @@ recorder runs without it when `--server` is not used.
 
 ### Design notes
 
-- A new SQLite connection is opened per request (`flask.g`); WAL mode and a busy timeout
-  prevent "database is locked" errors during concurrent uploads.
+- A new PostgreSQL connection is opened per request (`flask.g`), because psycopg2 connections
+  are not thread-safe. The Apache daemon runs 2 processes with 8 threads each.
+- The schema is created at startup under an advisory lock, so several Apache processes never
+  create the table at the same time. If the database is not reachable yet, the service retries
+  (30 attempts, 2 s apart) instead of crashing.
+- `mod_wsgi` comes from the Debian package that matches the image's system Python; the
+  application's own packages are installed into `/opt/venv` from `requirements.txt`.
 - Video URLs are built from `request.host_url`, not from a hard-coded host.
+- Uploaded files are served by Flask (`send_from_directory`). In production Apache could serve
+  them directly with an `Alias /media/ /app/uploads/` directive placed before `WSGIScriptAlias`.
 - File names are derived from the company name and sanitized; different company names that
   would map to the same file name get a short hash suffix so they never overwrite each other.
 - Files are written to a temporary name and renamed, so a half-uploaded file is never served.
@@ -230,7 +309,10 @@ Constants at the top of `qscript.py`:
   then continues. With `HEADLESS=1` it fails with a clear message.
 - **Selectors stopped working** - update the `SEL_*` constants in `qscript.py`.
 - **`UPLOAD FAILED: ... Connection refused`** - the web service is not running or the `--server`
-  address is wrong. Start `python web_service.py` and use the same host and port.
+  address is wrong. Start it with `docker compose up` and use the same host and port.
+- **`port is already allocated` on `docker compose up`** - port 8000 is busy; set `WEB_PORT=8080` in `.env`.
+- **`password authentication failed` in the `web` logs** - `DB_PASSWORD` was changed after the
+  database volume had been created; run `docker compose down -v` to recreate it.
 - **`PREVIEW FAILED`** - the preview needs a visible browser window (`headless=False`), so it
   cannot run on a machine without a display.
 

@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+*.pyc
+video
+demo
+uploads
+videos.db*
+qr-generator
+qscript.py
+capture_video.py
+video_client.py
+input.csv
+README.md

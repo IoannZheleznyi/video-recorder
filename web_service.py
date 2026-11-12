@@ -1,11 +1,14 @@
-"""web_service.py - small Flask service that stores and serves recorded videos.
+"""web_service.py - Flask video web service backed by PostgreSQL.
 
-Run:
-    python web_service.py
+In Docker the service runs under Apache + mod_wsgi (see Dockerfile and
+video_service.wsgi). For local development it can also be started directly:
 
-Environment variables:
-    FLASK_HOST   interface to listen on (default 0.0.0.0)
-    FLASK_PORT   port to listen on (default 8000)
+    DB_HOST=localhost DB_NAME=videos DB_USER=video_user DB_PASSWORD=... python web_service.py
+
+Database settings come only from environment variables:
+    DB_HOST, DB_NAME, DB_USER, DB_PASSWORD (required), DB_PORT (default 5432)
+    DB_CONNECT_ATTEMPTS, DB_CONNECT_DELAY - how long to wait for the database
+    at startup (defaults: 30 attempts, 2 seconds apart)
 
 Endpoints:
     POST /upload                       multipart: file + company_name (upsert)
@@ -13,46 +16,47 @@ Endpoints:
     GET  /media/<filename>             serves an uploaded video
     GET  /videos                       lists all records
 
-Videos are stored on disk in ./uploads next to this file, the database
-./videos.db (SQLite) keeps only the company name, the file path and the URL.
+Videos are stored on disk in ./uploads next to this file; the database keeps
+only the company name, the file path and the URL.
 """
 import hashlib
 import mimetypes
 import os
 import re
-import sqlite3
+import time
 import uuid
 from urllib.parse import quote
 
+import psycopg2
+import psycopg2.extras
 from flask import Flask, g, jsonify, request, send_from_directory
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-DB_PATH = os.path.join(BASE_DIR, "videos.db")
 
 ALLOWED_EXTENSIONS = {".webm", ".mp4", ".mov", ".mkv", ".m4v", ".ogv"}
 DEFAULT_EXTENSION = ".webm"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
-BUSY_TIMEOUT_S = 30
+SCHEMA_LOCK_ID = 727274
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     company_name TEXT NOT NULL UNIQUE,
     file_path TEXT NOT NULL,
     video_url TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
 
 UPSERT_SQL = """
 INSERT INTO videos (company_name, file_path, video_url)
-VALUES (?, ?, ?)
-ON CONFLICT(company_name) DO UPDATE SET
-    file_path = excluded.file_path,
-    video_url = excluded.video_url,
-    updated_at = datetime('now')
+VALUES (%s, %s, %s)
+ON CONFLICT (company_name) DO UPDATE SET
+    file_path = EXCLUDED.file_path,
+    video_url = EXCLUDED.video_url,
+    updated_at = NOW()
 """
 
 mimetypes.add_type("video/webm", ".webm")
@@ -61,18 +65,49 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
 
+def _env(name, default=None):
+    value = os.environ.get(name, default)
+    if value is None or value == "":
+        raise RuntimeError("Environment variable %s is not set." % name)
+    return value
+
+
 def _connect():
-    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_S)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = %d" % (BUSY_TIMEOUT_S * 1000))
-    return conn
+    return psycopg2.connect(
+        host=_env("DB_HOST"),
+        port=int(_env("DB_PORT", "5432")),
+        dbname=_env("DB_NAME"),
+        user=_env("DB_USER"),
+        password=_env("DB_PASSWORD"),
+        connect_timeout=10,
+    )
+
+
+def connect_with_retry():
+    """Connect to PostgreSQL, waiting until the database accepts connections."""
+    attempts = int(os.environ.get("DB_CONNECT_ATTEMPTS", "30"))
+    delay = float(os.environ.get("DB_CONNECT_DELAY", "2"))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _connect()
+        except psycopg2.OperationalError as exc:
+            last_error = exc
+            print("[web_service] database is not ready (attempt %d/%d): %s"
+                  % (attempt, attempts, str(exc).strip()), flush=True)
+            time.sleep(delay)
+    raise last_error
 
 
 def get_db():
-    """One SQLite connection per request (Flask's server is threaded)."""
+    """One PostgreSQL connection per request (psycopg2 connections are not thread-safe)."""
     if "db" not in g:
         g.db = _connect()
     return g.db
+
+
+def get_cursor():
+    return get_db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 @app.teardown_appcontext
@@ -83,13 +118,18 @@ def close_db(exc):
 
 
 def init_storage():
-    """Create uploads/ and videos.db with the videos table if they are missing."""
+    """Create uploads/ and the videos table if they are missing.
+
+    An advisory lock keeps several Apache worker processes from creating the
+    table at the same moment.
+    """
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    conn = _connect()
+    conn = connect_with_retry()
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(SCHEMA)
-        conn.commit()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_ID,))
+                cur.execute(SCHEMA)
     finally:
         conn.close()
 
@@ -103,15 +143,16 @@ def make_video_url(filename):
     return request.host_url + "media/" + quote(filename)
 
 
-def build_filename(db, company_name, extension):
+def build_filename(cur, company_name, extension):
     """File name derived from the company name, unique per company."""
     stem = re.sub(r"[^\w.-]+", "_", company_name, flags=re.UNICODE).strip("._")
     stem = stem[:100] or "video"
     filename = stem + extension
-    owner = db.execute(
-        "SELECT company_name FROM videos WHERE file_path = ?",
+    cur.execute(
+        "SELECT company_name FROM videos WHERE file_path = %s",
         (os.path.join(UPLOAD_DIR, filename),),
-    ).fetchone()
+    )
+    owner = cur.fetchone()
     if owner is not None and owner["company_name"] != company_name:
         digest = hashlib.sha1(company_name.encode("utf-8")).hexdigest()[:8]
         filename = "%s_%s%s" % (stem, digest, extension)
@@ -126,6 +167,11 @@ def not_found(exc):
 @app.errorhandler(413)
 def too_large(exc):
     return error_response("Uploaded file is too large.", 413)
+
+
+@app.errorhandler(psycopg2.OperationalError)
+def database_unavailable(exc):
+    return error_response("Database is not available.", 503)
 
 
 @app.route("/upload", methods=["POST"])
@@ -147,7 +193,10 @@ def upload_video():
         )
 
     db = get_db()
-    filename = build_filename(db, company_name, extension)
+    with get_cursor() as cur:
+        filename = build_filename(cur, company_name, extension)
+    db.commit()
+
     file_path = os.path.join(UPLOAD_DIR, filename)
     video_url = make_video_url(filename)
 
@@ -162,12 +211,16 @@ def upload_video():
         return error_response("Could not store the file: %s" % exc, 500)
 
     try:
-        previous = db.execute(
-            "SELECT file_path FROM videos WHERE company_name = ?", (company_name,)
-        ).fetchone()
-        db.execute(UPSERT_SQL, (company_name, file_path, video_url))
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT file_path FROM videos WHERE company_name = %s", (company_name,)
+            )
+            previous = cur.fetchone()
+            cur.execute(UPSERT_SQL, (company_name, file_path, video_url))
         db.commit()
-    except sqlite3.Error as exc:
+    except psycopg2.OperationalError:
+        raise
+    except psycopg2.Error as exc:
         db.rollback()
         return error_response("Database error: %s" % exc, 500)
 
@@ -186,10 +239,12 @@ def get_video_url():
     if not company_name:
         return error_response("Query parameter 'company_name' is required.", 400)
 
-    row = get_db().execute(
-        "SELECT company_name, file_path FROM videos WHERE company_name = ?",
-        (company_name,),
-    ).fetchone()
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT company_name, file_path FROM videos WHERE company_name = %s",
+            (company_name,),
+        )
+        row = cur.fetchone()
     if row is None:
         return error_response("Company '%s' was not found." % company_name, 404)
 
@@ -206,11 +261,19 @@ def media(filename):
 
 @app.route("/videos", methods=["GET"])
 def list_videos():
-    rows = get_db().execute(
-        "SELECT id, company_name, file_path, video_url, created_at, updated_at "
-        "FROM videos ORDER BY id"
-    ).fetchall()
-    return jsonify([dict(row) for row in rows])
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT id, company_name, file_path, video_url, created_at, updated_at "
+            "FROM videos ORDER BY id"
+        )
+        rows = cur.fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["created_at"] = item["created_at"].isoformat()
+        item["updated_at"] = item["updated_at"].isoformat()
+        result.append(item)
+    return jsonify(result)
 
 
 init_storage()

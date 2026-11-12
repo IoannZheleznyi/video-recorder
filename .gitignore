@@ -10,14 +10,12 @@ __pycache__/
 # (the sample recording lives in demo/ and is committed)
 video/
 
-# Web service data (created at runtime)
+# Web service data and secrets
 uploads/
-videos.db
-videos.db-wal
-videos.db-shm
+videos.db*
+.env
 
 # OS and editor files
 .DS_Store
 .idea/
 .vscode/
- 
